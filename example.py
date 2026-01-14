@@ -12,8 +12,6 @@ with a complete training loop. It demonstrates:
 
 from dataclasses import dataclass
 import argparse
-import signal
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,167 +24,185 @@ import tiktoken
 import wandb
 from datasets import load_dataset
 
-
-def setup_signal_handlers():
-    """Setup graceful shutdown on Ctrl+C"""
-    def cleanup(sig, frame):
-        print("\n\nShutting down gracefully...")
-        try:
-            wandb.finish()
-        except:
-            pass
-        torch.cuda.empty_cache()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-tokenizer = tiktoken.get_encoding("gpt2")
-# ============================================================================
-# GPT Model Architecture
-# ============================================================================
+MODEL_PATH = "gpt_model.pt"
+DATASET_CACHE = "wikitext103_tokens.pt"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+tokenizer = tiktoken.get_encoding("gpt2")
+
 
 @dataclass
 class GPTConfig:
     # Model architecture (scaled up for 94GB VRAM)
-    vocab_size = 50257    # GPT-2 vocabulary size
-    d_model = 768         # Embedding dimension (GPT-2 small size)
-    num_heads = 12        # Number of attention heads
-    num_layers = 12       # Number of transformer blocks
-    d_ff = 3072           # Feedforward dimension (4 * d_model)
-    max_seq_len = 1024    # Maximum sequence length
-    dropout = 0.1         # Dropout rate
-    
+    vocab_size = 50257  # GPT-2 vocabulary size
+    d_model = 768  # Embedding dimension (GPT-2 small size)
+    num_heads = 12  # Number of attention heads
+    num_layers = 12  # Number of transformer blocks
+    d_ff = 3072  # Feedforward dimension (4 * d_model)
+    max_seq_len = 1024  # Maximum sequence length
+    dropout = 0.1  # Dropout rate
+
     # Training (with mixed precision + checkpointing)
-    num_epochs = 3        # Number of training epochs
+    num_epochs = 3  # Number of training epochs
     learning_rate = 1e-4  # Peak learning rate (conservative)
-    min_lr = 1e-5         # Minimum LR (10% of peak)
-    warmup_steps = 100    # Linear warmup steps
-    batch_size = 64       # Batch size (higher with memory optimizations)
-    seq_len = 1024        # Sequence length (full context)
-    num_workers = 4       # DataLoader workers
-    use_amp = True        # Mixed precision training
+    min_lr = 1e-5  # Minimum LR (10% of peak)
+    warmup_steps = 100  # Linear warmup steps
+    batch_size = 64  # Batch size (higher with memory optimizations)
+    seq_len = 1024  # Sequence length (full context)
+    num_workers = 4  # DataLoader workers
+    use_amp = True  # Mixed precision training
     use_checkpointing = True  # Gradient checkpointing
-    
+
     # Logging & checkpoints
-    use_wandb = True      # Enable WandB logging
+    use_wandb = True  # Enable WandB logging
     wandb_project = "gpt-training"  # WandB project name
     checkpoint_interval = 500  # Save checkpoint every N batches
-    
+
     # Generation
-    temperature = 1.0     # Sampling temperature 
+    temperature = 1.0  # Sampling temperature
+    top_p = 0.9  # Nucleus sampling threshold
+    top_k = 40  # Top-k sampling threshold
+
 
 class MultiHeadAttention(nn.Module):
     """Multi-head self-attention mechanism"""
+
     def __init__(self, d_model=GPTConfig.d_model, num_heads=GPTConfig.num_heads):
         super().__init__()
         assert d_model % num_heads == 0
-        
+
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        
+
         # Query, Key, Value projections
-        self.W_q = nn.Linear(d_model, d_model) # This calculates the query vector
-        self.W_k = nn.Linear(d_model, d_model) # This calculates the key vector
-        self.W_v = nn.Linear(d_model, d_model) # This calculates the value vector
-        self.W_o = nn.Linear(d_model, d_model) # This calculates the output vector
-        
+        self.W_q = nn.Linear(d_model, d_model)  # This calculates the query vector
+        self.W_k = nn.Linear(d_model, d_model)  # This calculates the key vector
+        self.W_v = nn.Linear(d_model, d_model)  # This calculates the value vector
+        self.W_o = nn.Linear(d_model, d_model)  # This calculates the output vector
+
     def forward(self, x, mask=None):
         batch_size, seq_len, d_model = x.size()
-        
+
         # Project to Q, K, V
         Q = self.W_q(x)  # [batch, seq_len, d_model]
         K = self.W_k(x)
         V = self.W_v(x)
-        
+
         # Reshape for multi-head attention
         Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        
+
         # Scaled dot-product attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
+
         # Apply mask (causal mask for GPT)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, V)
-        
+
         # Concatenate heads
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, d_model)
-        
+
         # Output projection
         output = self.W_o(attn_output)
         return output
 
+
 # Feedforward layer as part of the transformer block
 class FeedForward(nn.Module):
     """Position-wise feedforward network"""
+
     def __init__(self, d_model=GPTConfig.d_model, d_ff=GPTConfig.d_ff):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
-        
+
     def forward(self, x):
         return self.linear2(F.relu(self.linear1(x)))
 
 
 class TransformerBlock(nn.Module):
     """Transformer block: self-attention + feedforward"""
-    def __init__(self, d_model=GPTConfig.d_model, num_heads=GPTConfig.num_heads, d_ff=GPTConfig.d_ff, dropout=GPTConfig.dropout):
+
+    def __init__(
+        self,
+        d_model=GPTConfig.d_model,
+        num_heads=GPTConfig.num_heads,
+        d_ff=GPTConfig.d_ff,
+        dropout=GPTConfig.dropout,
+    ):
         super().__init__()
         self.attention = MultiHeadAttention(d_model, num_heads)
         self.feedforward = FeedForward(d_model, d_ff)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        
+
     # Forward pass through the transformer block with residual connections
     def forward(self, x, mask=None):
         # Self-attention with residual connection
-        attn_output = self.attention(x, mask) # [batch_size, seq_len, d_model]
-        x = self.norm1(x + self.dropout(attn_output)) # [batch_size, seq_len, d_model]
-        
+        attn_output = self.attention(x, mask)  # [batch_size, seq_len, d_model]
+        x = self.norm1(x + self.dropout(attn_output))  # [batch_size, seq_len, d_model]
+
         # Feedforward with residual connection
-        ff_output = self.feedforward(x) # [batch_size, seq_len, d_model]
-        x = self.norm2(x + self.dropout(ff_output)) # [batch_size, seq_len, d_model]
-        
+        ff_output = self.feedforward(x)  # [batch_size, seq_len, d_model]
+        x = self.norm2(x + self.dropout(ff_output))  # [batch_size, seq_len, d_model]
+
         return x
 
 
 class SimpleGPT(nn.Module):
     """Simplified GPT model with optional gradient checkpointing"""
-    def __init__(self, vocab_size=GPTConfig.vocab_size, d_model=GPTConfig.d_model, num_heads=GPTConfig.num_heads, num_layers=GPTConfig.num_layers, 
-                 d_ff=GPTConfig.d_ff, max_seq_len=GPTConfig.max_seq_len, dropout=GPTConfig.dropout, use_checkpointing=False):
+
+    def __init__(
+        self,
+        vocab_size=GPTConfig.vocab_size,
+        d_model=GPTConfig.d_model,
+        num_heads=GPTConfig.num_heads,
+        num_layers=GPTConfig.num_layers,
+        d_ff=GPTConfig.d_ff,
+        max_seq_len=GPTConfig.max_seq_len,
+        dropout=GPTConfig.dropout,
+        use_checkpointing=False,
+    ):
         super().__init__()
         self.use_checkpointing = use_checkpointing
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(d_model, num_heads, d_ff, dropout)
+                for _ in range(num_layers)
+            ]
+        )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
         self.dropout = nn.Dropout(dropout)
         self.apply(self._init_weights)
-    
+
     # Initialize weights
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # [out_features, in_features]
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02
+            )  # [out_features, in_features]
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias) # [out_features]
+                torch.nn.init.zeros_(module.bias)  # [out_features]
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # [num_embeddings, embedding_dim]
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02
+            )  # [num_embeddings, embedding_dim]
             # Note: Embedding layers don't have bias, only weight
 
     # Forward pass through the model
     def forward(self, idx, targets=None):
-        """ 
+        """
         Args:
             idx: token indices [batch_size, seq_len]
             targets: target token indices [batch_size, seq_len] (for training)
@@ -195,21 +211,21 @@ class SimpleGPT(nn.Module):
         """
         # GPT expects 2D input: [batch_size, seq_len]
         batch_size, seq_len = idx.shape
-        
+
         # Create causal mask (prevent looking at future tokens)
         mask = torch.tril(torch.ones(seq_len, seq_len)).unsqueeze(0).unsqueeze(0)
         mask = mask.to(idx.device)
-        
+
         # Token embeddings
         tok_emb = self.token_embedding(idx)  # [batch, seq_len, d_model]
-        
+
         # Positional embeddings
         positions = torch.arange(0, seq_len, device=idx.device).unsqueeze(0)
         pos_emb = self.position_embedding(positions)  # [1, seq_len, d_model]
-        
+
         # Combine embeddings
         x = self.dropout(tok_emb + pos_emb)  # [batch, seq_len, d_model]
-        
+
         # Pass through transformer blocks (with optional checkpointing)
         for block in self.blocks:
             if self.use_checkpointing and self.training:
@@ -217,19 +233,19 @@ class SimpleGPT(nn.Module):
                 x = checkpoint(block, x, mask, use_reentrant=False)
             else:
                 x = block(x, mask)
-        
+
         # Final layer norm
         x = self.ln_f(x)
-        
+
         # Language modeling head
         logits = self.head(x)  # [batch, seq_len, vocab_size]
-        
+
         return logits
-    
+
     def generate(self, idx, max_new_tokens, temperature=1.0, top_p=0.9):
         """
         Generate tokens with temperature and nucleus (top-p) sampling.
-        
+
         Args:
             idx: Starting token indices [batch, seq_len]
             max_new_tokens: Number of tokens to generate
@@ -240,88 +256,89 @@ class SimpleGPT(nn.Module):
         with torch.no_grad():
             for _ in range(max_new_tokens):
                 # Crop context if too long
-                idx_cond = idx[:, -GPTConfig.max_seq_len:]
-                
+                idx_cond = idx[:, -GPTConfig.max_seq_len :]
+
                 # Get predictions
                 logits = self(idx_cond)  # [batch, seq_len, vocab_size]
-                
+
                 # Focus on last time step, apply temperature
                 logits = logits[:, -1, :] / temperature  # [batch, vocab_size]
-                
+
                 # Apply top-p (nucleus) sampling
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
+                    cumulative_probs = torch.cumsum(
+                        F.softmax(sorted_logits, dim=-1), dim=-1
+                    )
+
                     # Remove tokens with cumulative prob above threshold
                     sorted_indices_to_remove = cumulative_probs > top_p
                     # Keep at least one token
-                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[
+                        :, :-1
+                    ].clone()
                     sorted_indices_to_remove[:, 0] = False
-                    
+
                     # Scatter back to original indices
-                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                    logits[indices_to_remove] = float('-inf')
-                
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits[indices_to_remove] = float("-inf")
+
                 # Apply softmax to get probabilities
                 probs = F.softmax(logits, dim=-1)
-                
+
                 # Sample next token
                 idx_next = torch.multinomial(probs, num_samples=1)
-                
+
                 # Append to sequence
                 idx = torch.cat([idx, idx_next], dim=1)
-        
+
         return idx
 
 
-# ============================================================================
-# Training Setup
-# ============================================================================
-
+# Training Dataset
 class TextDataset(Dataset):
     """Dataset for language modeling with non-overlapping chunks"""
+
     def __init__(self, data, seq_len, stride=None):
         self.data = data
         self.seq_len = seq_len
         self.stride = stride or seq_len  # Default: no overlap
-    
+
     def __len__(self):
         return (len(self.data) - self.seq_len) // self.stride
-    
+
     def __getitem__(self, idx):
-        start = idx * self.stride
+        start = idx * self.sStride
         x = self.data[start : start + self.seq_len]
         y = self.data[start + 1 : start + self.seq_len + 1]
         return x, y
 
 
-DATASET_CACHE = "wikitext103_tokens.pt"
-
-
 def get_dataset():
     """Load WikiText-103 dataset, using cached tokenized version if available"""
     import os
-    
+
     # Check for cached tokenized data
     if os.path.exists(DATASET_CACHE):
         print(f"  Loading cached tokens from {DATASET_CACHE}...")
         data = torch.load(DATASET_CACHE, weights_only=True)
         return data
-    
+
     # Download and tokenize
     print("  Downloading WikiText-103 (first run only)...")
     dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
-    
+
     print("  Tokenizing (~103M tokens, this takes a few minutes)...")
     text = "\n".join(dataset["text"])
     token_ids = tokenizer.encode(text)
     data = torch.tensor(token_ids, dtype=torch.long)
-    
+
     # Cache to disk
     print(f"  Saving tokenized data to {DATASET_CACHE}...")
     torch.save(data, DATASET_CACHE)
-    
+
     return data
 
 
@@ -335,88 +352,104 @@ def create_dataloader(data, batch_size, seq_len, num_workers):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,  # Faster GPU transfer
-        drop_last=True,   # Avoid variable batch sizes
+        drop_last=True,  # Avoid variable batch sizes
     )
     return loader
 
-# ============================================================================
-# Training Loop
-# ============================================================================
+
+# Training Loop & Learning Rate Schedule
+
 
 def get_lr(step, total_steps):
     """Learning rate schedule with warmup and cosine decay"""
     warmup_steps = GPTConfig.warmup_steps
-    
+
     # Linear warmup
     if step < warmup_steps:
         return GPTConfig.learning_rate * (step / warmup_steps)
-    
+
     # Cosine decay after warmup
     decay_steps = total_steps - warmup_steps
     progress = (step - warmup_steps) / decay_steps
     cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-    return GPTConfig.min_lr + (GPTConfig.learning_rate - GPTConfig.min_lr) * cosine_decay
+    return (
+        GPTConfig.min_lr + (GPTConfig.learning_rate - GPTConfig.min_lr) * cosine_decay
+    )
 
 
-def train_epoch(model, dataloader, optimizer, scaler, device, epoch, global_step, total_steps):
+def train_epoch(
+    model, dataloader, optimizer, scaler, device, epoch, global_step, total_steps
+):
     """Train for one epoch with mixed precision and LR schedule"""
     model.train()
     total_loss = 0
     num_batches = 0
-    
+
     for x, y in dataloader:
         # Update learning rate
         lr = get_lr(global_step, total_steps)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
+            param_group["lr"] = lr
+
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        
+
         optimizer.zero_grad()
-        
+
         # Mixed precision forward pass
         with torch.autocast(device_type="cuda", enabled=GPTConfig.use_amp):
             logits = model(x)
             logits_flat = logits.view(-1, logits.size(-1))
             targets_flat = y.view(-1)
             loss = F.cross_entropy(logits_flat, targets_flat)
-        
+
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
-        
+
         # Unscale before clipping
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
+
         # Optimizer step with scaler
         scaler.step(optimizer)
         scaler.update()
-        
+
         total_loss += loss.item()
         num_batches += 1
         global_step += 1
-        
+
         # Logging
         if num_batches % 100 == 0:
             print(f"    Batch {num_batches}, Loss: {loss.item():.4f}, LR: {lr:.2e}")
             if GPTConfig.use_wandb:
-                wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/step": global_step})
-        
+                wandb.log(
+                    {
+                        "train/loss": loss.item(),
+                        "train/lr": lr,
+                        "train/step": global_step,
+                    }
+                )
+
         # Periodic checkpoint
         if num_batches % GPTConfig.checkpoint_interval == 0:
             import os
+
             os.makedirs("checkpoints", exist_ok=True)
-            checkpoint_path = f"checkpoints/checkpoint_epoch{epoch+1}_batch{num_batches}.pt"
-            torch.save({
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-                'epoch': epoch,
-                'global_step': global_step,
-                'loss': loss.item(),
-            }, checkpoint_path)
+            checkpoint_path = (
+                f"checkpoints/checkpoint_epoch{epoch + 1}_batch{num_batches}.pt"
+            )
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "loss": loss.item(),
+                },
+                checkpoint_path,
+            )
             print(f"    💾 Checkpoint saved: {checkpoint_path}")
-    
+
     return total_loss / num_batches, global_step
 
 
@@ -424,12 +457,13 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, global_step
 # Train Function
 # ============================================================================
 
+
 def train(model, device):
     """Train the model with mixed precision and WandB logging"""
-    print("="*70)
+    print("=" * 70)
     print("Training")
-    print("="*70)
-    
+    print("=" * 70)
+
     # Initialize WandB
     if GPTConfig.use_wandb:
         wandb.init(
@@ -446,75 +480,82 @@ def train(model, device):
                 "num_epochs": GPTConfig.num_epochs,
                 "use_amp": GPTConfig.use_amp,
                 "use_checkpointing": GPTConfig.use_checkpointing,
-            }
+            },
         )
-    
+
     # Load dataset
-    print(f"\nDownloading and preparing dataset...")
+    print("\nDownloading and preparing dataset...")
     data = get_dataset()
     print(f"  Dataset size: {len(data):,} tokens")
-    
+
     # Create DataLoader
-    print(f"  Creating DataLoader (batch_size={GPTConfig.batch_size}, seq_len={GPTConfig.seq_len}, workers={GPTConfig.num_workers})")
-    dataloader = create_dataloader(data, GPTConfig.batch_size, GPTConfig.seq_len, GPTConfig.num_workers)
+    print(
+        f"  Creating DataLoader (batch_size={GPTConfig.batch_size}, seq_len={GPTConfig.seq_len}, workers={GPTConfig.num_workers})"
+    )
+    dataloader = create_dataloader(
+        data, GPTConfig.batch_size, GPTConfig.seq_len, GPTConfig.num_workers
+    )
     print(f"  Batches per epoch: {len(dataloader):,} (non-overlapping chunks)")
-    
+
     # Optimizer and scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate)
     scaler = GradScaler(enabled=GPTConfig.use_amp)
-    
+
     # Calculate total steps for LR schedule
     total_steps = len(dataloader) * GPTConfig.num_epochs
-    
+
     print(f"  Mixed precision (AMP): {GPTConfig.use_amp}")
     print(f"  Gradient checkpointing: {GPTConfig.use_checkpointing}")
     print(f"  LR schedule: warmup {GPTConfig.warmup_steps} steps, then cosine decay")
     print(f"  Peak LR: {GPTConfig.learning_rate}, Min LR: {GPTConfig.min_lr}")
-    
+
     # Training loop
     global_step = 0
     for epoch in range(GPTConfig.num_epochs):
-        print(f"\nEpoch {epoch+1}/{GPTConfig.num_epochs}")
-        loss, global_step = train_epoch(model, dataloader, optimizer, scaler, device, epoch, global_step, total_steps)
+        print(f"\nEpoch {epoch + 1}/{GPTConfig.num_epochs}")
+        loss, global_step = train_epoch(
+            model,
+            dataloader,
+            optimizer,
+            scaler,
+            device,
+            epoch,
+            global_step,
+            total_steps,
+        )
         print(f"  Average Loss: {loss:.4f}")
-        
+
         if GPTConfig.use_wandb:
             wandb.log({"train/epoch_loss": loss, "train/epoch": epoch + 1})
-    
+
     if GPTConfig.use_wandb:
         wandb.finish()
-    
-    print(f"\nTraining Complete!")
+
+    print("\nTraining Complete!")
     return model
 
 
-# ============================================================================
-# Generate Function
-# ============================================================================
-
-def generate_text(model, prompt, max_new_tokens=50, temperature=1.0, top_p=0.9, device="cpu"):
+# Text Generation
+def generate_text(
+    model, prompt, max_new_tokens=50, temperature=1.0, top_p=0.9, device="cpu"
+):
     """Generate text from a prompt"""
     model.eval()
-    
+
     # Tokenize the prompt
     token_ids = tokenizer.encode(prompt)
     context = torch.tensor(token_ids).unsqueeze(0).to(device)  # [1, seq_len]
-    
+
     # Generate
     with torch.no_grad():
-        generated_ids = model.generate(context, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p)
-    
+        generated_ids = model.generate(
+            context, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p
+        )
+
     # Decode back to text
     generated_text = tokenizer.decode(generated_ids[0].tolist())
-    
+
     return generated_text
-
-
-# ============================================================================
-# Main Script
-# ============================================================================
-
-MODEL_PATH = "gpt_model.pt"
 
 
 def create_model(device):
@@ -527,7 +568,7 @@ def create_model(device):
         d_ff=GPTConfig.d_ff,
         max_seq_len=GPTConfig.max_seq_len,
         dropout=GPTConfig.dropout,
-        use_checkpointing=GPTConfig.use_checkpointing
+        use_checkpointing=GPTConfig.use_checkpointing,
     ).to(device)
     return model
 
@@ -550,64 +591,104 @@ def load_from_checkpoint(device, checkpoint_path):
     """Load model from a training checkpoint"""
     model = create_model(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(checkpoint["model"])
     print(f"Model loaded from checkpoint: {checkpoint_path}")
-    print(f"  Epoch: {checkpoint['epoch']+1}, Step: {checkpoint['global_step']}, Loss: {checkpoint['loss']:.4f}")
+    print(
+        f"  Epoch: {checkpoint['epoch'] + 1}, Step: {checkpoint['global_step']}, Loss: {checkpoint['loss']:.4f}"
+    )
     return model
 
 
 def run_train(device):
     """Train the model and save it"""
-    setup_signal_handlers()
-    
-    print("="*70)
+
+    print("=" * 70)
     print("Training GPT Model")
-    print("="*70)
-    
+    print("=" * 70)
+
     print(f"\nUsing device: {device}")
-    print(f"\nModel config:")
+    print("\nModel config:")
     print(f"  Vocabulary size: {GPTConfig.vocab_size}")
     print(f"  Embedding dimension: {GPTConfig.d_model}")
     print(f"  Number of heads: {GPTConfig.num_heads}")
     print(f"  Number of layers: {GPTConfig.num_layers}")
     print(f"  Max sequence length: {GPTConfig.max_seq_len}")
-    
+
     model = create_model(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {num_params:,}")
-    
+
     model = train(model, device)
     save_model(model)
-    
+
     return model
 
 
-def run_generate(prompt, device, max_tokens=50, temperature=0.8, top_p=0.9, checkpoint=None):
+def run_generate(
+    prompt, device, max_tokens=50, temperature=0.8, top_p=0.9, checkpoint=None
+):
     """Load model and generate text from prompt"""
     if checkpoint:
         model = load_from_checkpoint(device, checkpoint)
     else:
         model = load_model(device)
-    generated = generate_text(model, prompt, max_new_tokens=max_tokens, temperature=temperature, top_p=top_p, device=device)
+    generated = generate_text(
+        model,
+        prompt,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        device=device,
+    )
     print(f"\n{generated}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="GPT Training and Generation")
-    parser.add_argument("mode", choices=["train", "generate"], help="Mode: train or generate")
-    parser.add_argument("--prompt", "-p", type=str, default="The history of", help="Prompt for generation")
-    parser.add_argument("--max-tokens", "-n", type=int, default=50, help="Max tokens to generate")
-    parser.add_argument("--temperature", "-t", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Nucleus sampling threshold (0.9 = top 90%% prob mass)")
-    parser.add_argument("--checkpoint", "-c", type=str, default=None, help="Load from checkpoint file (for generate)")
-    
+    parser.add_argument(
+        "mode", choices=["train", "generate"], help="Mode: train or generate"
+    )
+    parser.add_argument(
+        "--prompt",
+        "-p",
+        type=str,
+        default="The history of",
+        help="Prompt for generation",
+    )
+    parser.add_argument(
+        "--max-tokens", "-n", type=int, default=50, help="Max tokens to generate"
+    )
+    parser.add_argument(
+        "--temperature", "-t", type=float, default=0.8, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Nucleus sampling threshold (0.9 = top 90%% prob mass)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        "-c",
+        type=str,
+        default=None,
+        help="Load from checkpoint file (for generate)",
+    )
+
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     if args.mode == "train":
         run_train(device)
     elif args.mode == "generate":
-        run_generate(args.prompt, device, args.max_tokens, args.temperature, args.top_p, args.checkpoint)
+        run_generate(
+            args.prompt,
+            device,
+            args.max_tokens,
+            args.temperature,
+            args.top_p,
+            args.checkpoint,
+        )
 
 
 if __name__ == "__main__":
