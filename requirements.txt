@@ -1,0 +1,6 @@
+dataclasses
+torch
+tiktoken
+numpy
+datasets
+wandb
