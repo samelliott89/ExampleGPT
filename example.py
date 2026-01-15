@@ -36,6 +36,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 tokenizer = tiktoken.get_encoding("gpt2")
 
+# Basic sanity checks (kept as asserts so they can be disabled with `python -O`)
+assert tokenizer.n_vocab == 50257, "Expected GPT-2 tokenizer vocab size to be 50257"
+
 
 @dataclass
 class GPTConfig:
@@ -70,6 +73,17 @@ class GPTConfig:
     top_k = 40  # Top-k sampling threshold
 
 
+# Config assertions
+assert GPTConfig.d_model % GPTConfig.num_heads == 0, "d_model must be divisible by num_heads"
+assert GPTConfig.seq_len <= GPTConfig.max_seq_len, "seq_len must be <= max_seq_len"
+assert GPTConfig.warmup_steps >= 0, "warmup_steps must be >= 0"
+assert GPTConfig.learning_rate > 0 and GPTConfig.min_lr > 0, "learning rates must be > 0"
+assert GPTConfig.learning_rate >= GPTConfig.min_lr, "learning_rate must be >= min_lr"
+assert GPTConfig.checkpoint_interval > 0, "checkpoint_interval must be > 0"
+assert 0 < GPTConfig.top_p <= 1.0, "top_p must be in (0, 1]"
+assert GPTConfig.top_k >= 0, "top_k must be >= 0"
+
+
 class MultiHeadAttention(nn.Module):
     """Multi-head self-attention mechanism"""
 
@@ -96,7 +110,9 @@ class MultiHeadAttention(nn.Module):
         self.W_o._gpt2_residual_proj = True
 
     def forward(self, x, mask=None):
+        assert x.dim() == 3, "attention input must be [batch, seq_len, d_model]"
         batch_size, seq_len, d_model = x.size()
+        assert d_model == self.d_model, "last dim of x must equal d_model"
 
         # Project to Q, K, V
         Q = self.W_q(x)  # [batch, seq_len, d_model]
@@ -246,12 +262,17 @@ class SimpleGPT(nn.Module):
             logits: [batch_size, seq_len, vocab_size]
         """
         # GPT expects 2D input: [batch_size, seq_len]
+        assert idx.dim() == 2, "idx must be [batch, seq_len]"
+        assert idx.dtype == torch.long, "idx must be torch.long token IDs"
         _, seq_len = idx.shape
+        assert seq_len <= GPTConfig.max_seq_len, "seq_len exceeds model max_seq_len"
 
         # Slice the cached causal mask to current sequence length
         mask = self.mask[:, :, :seq_len, :seq_len]
 
         # Token embeddings
+        assert (idx >= 0).all(), "token IDs must be non-negative"
+        assert idx.max().item() < GPTConfig.vocab_size, "token ID exceeds vocab_size"
         tok_emb = self.token_embedding(idx)  # [batch, seq_len, d_model]
 
         # Positional embeddings
@@ -289,6 +310,11 @@ class SimpleGPT(nn.Module):
             top_k: Keep only the top-k tokens (0 disables)
         """
         self.eval()
+        assert idx.dim() == 2, "idx must be [batch, seq_len]"
+        assert max_new_tokens >= 0, "max_new_tokens must be >= 0"
+        assert temperature > 0, "temperature must be > 0"
+        assert 0 < top_p <= 1.0, "top_p must be in (0, 1]"
+        assert top_k >= 0, "top_k must be >= 0"
         with torch.no_grad():
             for _ in range(max_new_tokens):
                 # Crop context if too long
@@ -355,6 +381,7 @@ class TextDataset(Dataset):
 
     def __getitem__(self, idx):
         start = idx * self.stride
+        assert start + self.seq_len + 1 <= len(self.data), "batch slice is out of bounds"
         x = self.data[start : start + self.seq_len]
         y = self.data[start + 1 : start + self.seq_len + 1]
         return x, y
@@ -406,6 +433,8 @@ def create_dataloader(data, batch_size, seq_len, num_workers):
 
 def get_lr(step, total_steps):
     """Learning rate schedule with warmup and cosine decay"""
+    assert total_steps > 0, "total_steps must be > 0"
+    assert 0 <= step <= total_steps, "step must be within [0, total_steps]"
     warmup_steps = GPTConfig.warmup_steps
 
     # Linear warmup
