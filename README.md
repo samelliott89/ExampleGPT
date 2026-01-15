@@ -21,6 +21,10 @@ A clean, educational implementation of a GPT (Generative Pre-trained Transformer
   - Temperature-based sampling
   - Nucleus (top-p) sampling
   - Customizable generation parameters
+ 
+## Train/Loss
+
+<img width="3696" height="1594" alt="simplesnap-1-15-2026_at_10-15-10" src="https://github.com/user-attachments/assets/85c0a7a2-289e-44dd-b676-f0e837216f36" />
 
 ## Requirements
 
