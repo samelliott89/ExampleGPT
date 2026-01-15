@@ -5,19 +5,23 @@ This file implements a simplified GPT (Generative Pre-trained Transformer) model
 with a complete training loop. It demonstrates:
 1. Token embeddings
 2. Positional embeddings
-3. Transformer blocks (self-attention + feedforward)
-4. Language modeling head
-5. Training loop with backpropagation
+3. Transformer blocks (pre-LN, GPT-2 style)
+4. Causal self-attention mask (cached as a buffer)
+5. Weight tying (token embedding <-> output head)
+6. Training loop (AdamW + warmup/cosine LR + periodic checkpoints)
+7. Text generation (temperature + top-k + top-p sampling)
 """
 
 from dataclasses import dataclass
 import argparse
+from datetime import datetime
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.checkpoint import checkpoint
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 import math
 
 import tiktoken
@@ -26,6 +30,7 @@ from datasets import load_dataset
 
 MODEL_PATH = "gpt_model.pt"
 DATASET_CACHE = "wikitext103_tokens.pt"
+RUNS_DIR = "runs"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -68,19 +73,27 @@ class GPTConfig:
 class MultiHeadAttention(nn.Module):
     """Multi-head self-attention mechanism"""
 
-    def __init__(self, d_model=GPTConfig.d_model, num_heads=GPTConfig.num_heads):
+    def __init__(
+        self,
+        d_model=GPTConfig.d_model,
+        num_heads=GPTConfig.num_heads,
+        dropout=GPTConfig.dropout,
+    ):
         super().__init__()
         assert d_model % num_heads == 0
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
+        self.attn_dropout = nn.Dropout(dropout)
 
         # Query, Key, Value projections
         self.W_q = nn.Linear(d_model, d_model)  # This calculates the query vector
         self.W_k = nn.Linear(d_model, d_model)  # This calculates the key vector
         self.W_v = nn.Linear(d_model, d_model)  # This calculates the value vector
         self.W_o = nn.Linear(d_model, d_model)  # This calculates the output vector
+        # Mark residual projection for GPT-2-style scaled init
+        self.W_o._gpt2_residual_proj = True
 
     def forward(self, x, mask=None):
         batch_size, seq_len, d_model = x.size()
@@ -103,6 +116,7 @@ class MultiHeadAttention(nn.Module):
             scores = scores.masked_fill(mask == 0, float("-inf"))
 
         attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
         attn_output = torch.matmul(attn_weights, V)
 
         # Concatenate heads
@@ -114,7 +128,7 @@ class MultiHeadAttention(nn.Module):
         return output
 
 
-# Feedforward layer as part of the transformer block
+# Feedforward (MLP)
 class FeedForward(nn.Module):
     """Position-wise feedforward network"""
 
@@ -122,6 +136,8 @@ class FeedForward(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
+        # Mark residual projection for GPT-2-style scaled init
+        self.linear2._gpt2_residual_proj = True
 
     def forward(self, x):
         return self.linear2(F.relu(self.linear1(x)))
@@ -138,27 +154,25 @@ class TransformerBlock(nn.Module):
         dropout=GPTConfig.dropout,
     ):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, num_heads)
+        self.attention = MultiHeadAttention(d_model, num_heads, dropout=dropout)
         self.feedforward = FeedForward(d_model, d_ff)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    # Forward pass through the transformer block with residual connections
+    # Pre-LN transformer block (GPT-2 style)
     def forward(self, x, mask=None):
-        # Self-attention with residual connection
-        attn_output = self.attention(x, mask)  # [batch_size, seq_len, d_model]
-        x = self.norm1(x + self.dropout(attn_output))  # [batch_size, seq_len, d_model]
+        # Attention sub-layer
+        x = x + self.dropout(self.attention(self.norm1(x), mask))
 
-        # Feedforward with residual connection
-        ff_output = self.feedforward(x)  # [batch_size, seq_len, d_model]
-        x = self.norm2(x + self.dropout(ff_output))  # [batch_size, seq_len, d_model]
+        # MLP sub-layer
+        x = x + self.dropout(self.feedforward(self.norm2(x)))
 
         return x
 
 
 class SimpleGPT(nn.Module):
-    """Simplified GPT model with optional gradient checkpointing"""
+    """Simplified GPT model (pre-LN) with optional gradient checkpointing"""
 
     def __init__(
         self,
@@ -175,6 +189,14 @@ class SimpleGPT(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
+
+        # Causal mask buffer (avoid re-allocating every forward pass)
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool)).view(
+                1, 1, max_seq_len, max_seq_len
+            ),
+        )
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(d_model, num_heads, d_ff, dropout)
@@ -186,12 +208,20 @@ class SimpleGPT(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.apply(self._init_weights)
 
+        # Weight tying (GPT-2 style): share token embedding weights with output head
+        # token_embedding.weight and head.weight are both [vocab_size, d_model]
+        self.head.weight = self.token_embedding.weight
+
     # Initialize weights
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(
-                module.weight, mean=0.0, std=0.02
-            )  # [out_features, in_features]
+            # GPT-2 scales residual projections by 1/sqrt(2 * num_layers)
+            # to prevent activation growth in deep networks.
+            std = 0.02
+            if getattr(module, "_gpt2_residual_proj", False):
+                std = 0.02 / math.sqrt(2 * GPTConfig.num_layers)
+
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)  # [out_features]
         elif isinstance(module, nn.Embedding):
@@ -210,11 +240,10 @@ class SimpleGPT(nn.Module):
             logits: [batch_size, seq_len, vocab_size]
         """
         # GPT expects 2D input: [batch_size, seq_len]
-        batch_size, seq_len = idx.shape
+        _, seq_len = idx.shape
 
-        # Create causal mask (prevent looking at future tokens)
-        mask = torch.tril(torch.ones(seq_len, seq_len)).unsqueeze(0).unsqueeze(0)
-        mask = mask.to(idx.device)
+        # Slice the cached causal mask to current sequence length
+        mask = self.mask[:, :, :seq_len, :seq_len]
 
         # Token embeddings
         tok_emb = self.token_embedding(idx)  # [batch, seq_len, d_model]
@@ -242,15 +271,16 @@ class SimpleGPT(nn.Module):
 
         return logits
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_p=0.9):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_p=0.9, top_k=0):
         """
-        Generate tokens with temperature and nucleus (top-p) sampling.
+        Generate tokens with temperature + (optional) top-k + top-p sampling.
 
         Args:
             idx: Starting token indices [batch, seq_len]
             max_new_tokens: Number of tokens to generate
             temperature: Controls randomness (lower = more focused)
             top_p: Nucleus sampling threshold (0.9 = keep tokens summing to 90% prob)
+            top_k: Keep only the top-k tokens (0 disables)
         """
         self.eval()
         with torch.no_grad():
@@ -263,6 +293,14 @@ class SimpleGPT(nn.Module):
 
                 # Focus on last time step, apply temperature
                 logits = logits[:, -1, :] / temperature  # [batch, vocab_size]
+
+                # Apply top-k sampling (optional)
+                if top_k and top_k > 0:
+                    top_k = min(top_k, logits.size(-1))
+                    kth_values = (
+                        torch.topk(logits, k=top_k, dim=-1).values[:, -1].unsqueeze(-1)
+                    )
+                    logits = logits.masked_fill(logits < kth_values, float("-inf"))
 
                 # Apply top-p (nucleus) sampling
                 if top_p < 1.0:
@@ -310,7 +348,7 @@ class TextDataset(Dataset):
         return (len(self.data) - self.seq_len) // self.stride
 
     def __getitem__(self, idx):
-        start = idx * self.sStride
+        start = idx * self.stride
         x = self.data[start : start + self.seq_len]
         y = self.data[start + 1 : start + self.seq_len + 1]
         return x, y
@@ -378,7 +416,15 @@ def get_lr(step, total_steps):
 
 
 def train_epoch(
-    model, dataloader, optimizer, scaler, device, epoch, global_step, total_steps
+    model,
+    dataloader,
+    optimizer,
+    scaler,
+    device,
+    epoch,
+    global_step,
+    total_steps,
+    checkpoint_dir,
 ):
     """Train for one epoch with mixed precision and LR schedule"""
     model.train()
@@ -431,11 +477,9 @@ def train_epoch(
 
         # Periodic checkpoint
         if num_batches % GPTConfig.checkpoint_interval == 0:
-            import os
-
-            os.makedirs("checkpoints", exist_ok=True)
-            checkpoint_path = (
-                f"checkpoints/checkpoint_epoch{epoch + 1}_batch{num_batches}.pt"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            checkpoint_path = os.path.join(
+                checkpoint_dir, f"checkpoint_epoch{epoch + 1}_batch{num_batches}.pt"
             )
             torch.save(
                 {
@@ -448,17 +492,15 @@ def train_epoch(
                 },
                 checkpoint_path,
             )
-            print(f"    💾 Checkpoint saved: {checkpoint_path}")
+            print(f"    Checkpoint saved: {checkpoint_path}")
 
     return total_loss / num_batches, global_step
 
 
-# ============================================================================
-# Train Function
-# ============================================================================
+# Training
 
 
-def train(model, device):
+def train(model, device, checkpoint_dir):
     """Train the model with mixed precision and WandB logging"""
     print("=" * 70)
     print("Training")
@@ -499,7 +541,7 @@ def train(model, device):
 
     # Optimizer and scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate)
-    scaler = GradScaler(enabled=GPTConfig.use_amp)
+    scaler = GradScaler("cuda", enabled=GPTConfig.use_amp)
 
     # Calculate total steps for LR schedule
     total_steps = len(dataloader) * GPTConfig.num_epochs
@@ -522,6 +564,7 @@ def train(model, device):
             epoch,
             global_step,
             total_steps,
+            checkpoint_dir,
         )
         print(f"  Average Loss: {loss:.4f}")
 
@@ -535,11 +578,17 @@ def train(model, device):
     return model
 
 
-# Text Generation
+# Generation
 def generate_text(
-    model, prompt, max_new_tokens=50, temperature=1.0, top_p=0.9, device="cpu"
+    model,
+    prompt,
+    max_new_tokens=50,
+    temperature=1.0,
+    top_p=0.9,
+    top_k=0,
+    device="cpu",
 ):
-    """Generate text from a prompt"""
+    """Generate text from a prompt using temperature + top-k + top-p sampling."""
     model.eval()
 
     # Tokenize the prompt
@@ -549,7 +598,11 @@ def generate_text(
     # Generate
     with torch.no_grad():
         generated_ids = model.generate(
-            context, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p
+            context,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
         )
 
     # Decode back to text
@@ -602,6 +655,13 @@ def load_from_checkpoint(device, checkpoint_path):
 def run_train(device):
     """Train the model and save it"""
 
+    # Create a unique run folder per training session
+    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    print(f"\nRun dir: {run_dir}")
+
     print("=" * 70)
     print("Training GPT Model")
     print("=" * 70)
@@ -618,14 +678,20 @@ def run_train(device):
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {num_params:,}")
 
-    model = train(model, device)
-    save_model(model)
+    # Train, writing checkpoints into this run folder
+    model = train(model, device, checkpoints_dir)
+
+    # Save final model into the run folder
+    save_model(model, path=os.path.join(run_dir, "gpt_model.pt"))
+
+    # (Optional convenience) also overwrite top-level gpt_model.pt as "latest"
+    save_model(model, path=MODEL_PATH)
 
     return model
 
 
 def run_generate(
-    prompt, device, max_tokens=50, temperature=0.8, top_p=0.9, checkpoint=None
+    prompt, device, max_tokens=50, temperature=0.8, top_p=0.9, top_k=0, checkpoint=None
 ):
     """Load model and generate text from prompt"""
     if checkpoint:
@@ -638,6 +704,7 @@ def run_generate(
         max_new_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
         device=device,
     )
     print(f"\n{generated}")
@@ -659,13 +726,23 @@ def main():
         "--max-tokens", "-n", type=int, default=50, help="Max tokens to generate"
     )
     parser.add_argument(
-        "--temperature", "-t", type=float, default=0.8, help="Sampling temperature"
+        "--temperature",
+        "-t",
+        type=float,
+        default=GPTConfig.temperature,
+        help="Sampling temperature",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.9,
+        default=GPTConfig.top_p,
         help="Nucleus sampling threshold (0.9 = top 90%% prob mass)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=GPTConfig.top_k,
+        help="Top-k sampling threshold (40 = keep top 40 tokens)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -687,6 +764,7 @@ def main():
             args.max_tokens,
             args.temperature,
             args.top_p,
+            args.top_k,
             args.checkpoint,
         )
 

@@ -3,3 +3,6 @@ wandb
 .venv
 wikitext*
 gpt_model.pt
+.ruff_cache
+runs
+__pycache__
