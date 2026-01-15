@@ -132,15 +132,20 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     """Position-wise feedforward network"""
 
-    def __init__(self, d_model=GPTConfig.d_model, d_ff=GPTConfig.d_ff):
+    def __init__(self, d_model=GPTConfig.d_model, d_ff=GPTConfig.d_ff, dropout=GPTConfig.dropout):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
         # Mark residual projection for GPT-2-style scaled init
         self.linear2._gpt2_residual_proj = True
 
     def forward(self, x):
-        return self.linear2(F.relu(self.linear1(x)))
+        x = self.linear1(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
 
 
 class TransformerBlock(nn.Module):
@@ -155,7 +160,7 @@ class TransformerBlock(nn.Module):
     ):
         super().__init__()
         self.attention = MultiHeadAttention(d_model, num_heads, dropout=dropout)
-        self.feedforward = FeedForward(d_model, d_ff)
+        self.feedforward = FeedForward(d_model, d_ff, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -172,7 +177,7 @@ class TransformerBlock(nn.Module):
 
 
 class SimpleGPT(nn.Module):
-    """Simplified GPT model (pre-LN) with optional gradient checkpointing"""
+    """Simplified GPT model (GPT-2-ish, pre-LN) with optional gradient checkpointing"""
 
     def __init__(
         self,
@@ -187,6 +192,7 @@ class SimpleGPT(nn.Module):
     ):
         super().__init__()
         self.use_checkpointing = use_checkpointing
+        self.num_layers = num_layers
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
 
@@ -219,7 +225,7 @@ class SimpleGPT(nn.Module):
             # to prevent activation growth in deep networks.
             std = 0.02
             if getattr(module, "_gpt2_residual_proj", False):
-                std = 0.02 / math.sqrt(2 * GPTConfig.num_layers)
+                std = 0.02 / math.sqrt(2 * self.num_layers)
 
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
